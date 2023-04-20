@@ -7,6 +7,8 @@ use std::thread;
 extern crate libc;
 extern crate termios;
 
+mod mux;
+
 fn open_pty_master() -> RawFd {
     let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR) };
     unsafe { libc::grantpt(master_fd) };
@@ -51,83 +53,27 @@ fn child_process(master_fd: RawFd, slave_name: CString) {
 	}
 }
 
-fn parent_setup() -> termios::Termios {
-	// Set the parent's terminal to raw mode
-	let mut parent_term: termios::Termios = unsafe { std::mem::zeroed() };
-	termios::tcgetattr(libc::STDIN_FILENO, &mut parent_term).unwrap();
-	let mut raw_parent_term = parent_term.clone();
-	termios::cfmakeraw(&mut raw_parent_term);
-	termios::tcsetattr(libc::STDIN_FILENO, termios::TCSANOW, &raw_parent_term).unwrap();
-    parent_term
-}
+fn parent_process(raw_master_fd: RawFd, child_pid: i32) {
+    let mux = mux::Mux::new();
 
-fn handle_stdout(master_fd: RawFd) {
-    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
-
-    let mut buf = [0; 4096 * 16];
-    loop {
-        match master.read(&mut buf) {
-            Ok(n) => {
-                if n == 0 {
-                    break;
-                }
-                let mut output_data = Vec::with_capacity(n);
-                for b in &buf[..n] {
-                    output_data.push(*b);
-                    if *b == b'\n' {
-                        output_data.push(b'\r');
-                    }
-                }
-                let stdout = std::io::stdout();
-                let mut stdout_lock = stdout.lock();
-                let _ = stdout_lock.write_all(&output_data);
-                let _ = stdout_lock.flush();
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn handle_stdin(master_fd: RawFd) {
-    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
-
-    let mut buf = [0; 4096 * 16];
-    loop {
-        match std::io::stdin().read(&mut buf) {
-            Ok(n) => {
-                if n == 0 {
-                    break;
-                }
-                let stdout = std::io::stdout();
-                let mut stdout_lock = stdout.lock();
-                for b in &buf[..n] {
-                    let _ = master.write_all(&[*b]);
-                    if *b != b'\r' {
-                        let _ = stdout_lock.write_all(&[*b]);
-                    }
-                }
-                let _ = stdout_lock.flush();
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn parent_process(master_fd: RawFd) {
-
-	let _stdout_thread = thread::spawn(move || {
-        handle_stdout(master_fd);
+    let _stdout_thread = thread::spawn(move || {
+        let mut master_fd = unsafe { std::fs::File::from_raw_fd(raw_master_fd) };
+        mux::Mux::handle_stdout(&mut master_fd);
     });
 
     let _stdin_thread = thread::spawn(move || {
-        handle_stdin(master_fd);
+        let mut master_fd = unsafe { std::fs::File::from_raw_fd(raw_master_fd) };
+        mux::Mux::handle_stdin(&mut master_fd);
     });
+
+    // Wait for the child process to exit
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(child_pid, &mut status, 0) };
+
+    mux.cleanup();
+    process::exit(0);
 }
 
-fn parent_cleanup(parent_term: termios::Termios) {
-    // Restore the parent's terminal settings
-    termios::tcsetattr(libc::STDIN_FILENO, termios::TCSANOW, &parent_term).unwrap();
-}
 
 fn main() {
     let master_fd = open_pty_master();
@@ -137,15 +83,7 @@ fn main() {
     if pid == 0 {
         child_process(master_fd, slave_name);
     } else {
-        let parent_term = parent_setup();
-        parent_process(master_fd);
-
-        // Wait for the child process to exit
-        let mut status: libc::c_int = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-
-        parent_cleanup(parent_term);
-        process::exit(0);
+        parent_process(master_fd, pid);
     }
 }
 
