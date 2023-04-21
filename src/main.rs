@@ -1,11 +1,24 @@
 use std::ffi::{CStr, CString};
-use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::process;
 use std::thread;
 
 extern crate libc;
 extern crate termios;
+
+/// rustmux architecture:
+///
+///                                                     MUX
+///                                     |---------------------------------|
+///
+/// ========        ============        =======                     =======        ========
+/// |      | stdin  |          | stdin  |     | stdin   ...  stdin  |     | stdin  |      |
+/// |      + =====> +          | =====> +     | =====>       =====> +     | =====> +      |
+/// | USER |        | TERMINAL |        | PTY |         ...         | PTY |        | PROC |
+/// |      + <===== |          + <===== |     + <=====       <===== |     + <===== +      |
+/// |      | stdout |          | stdout |     | stdout  ...  stdout |     | stdout |      |
+/// ========        ============        =======                     =======        ========
+
 
 mod mux;
 

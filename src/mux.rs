@@ -1,4 +1,3 @@
-use std::os::unix::io::{FromRawFd, RawFd};
 use std::io::{Read, Write};
 
 extern crate termios;
