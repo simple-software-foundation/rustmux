@@ -1,117 +1,167 @@
-use std::ffi::{CStr, CString};
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::process;
-use std::thread;
+use ncurses::*;
 
-extern crate libc;
-extern crate termios;
-
-///
-///                                                     MUX
-///                                     |---------------------------------|
-///
-/// ========        ============        =======                     =======        ========
-/// |      | stdin  |          | stdin  |     | stdin   ...  stdin  |     | stdin  |      |
-/// |      + =====> +          | =====> +     | =====>       =====> +     | =====> +      |
-/// | USER |        | TERMINAL |        |     |         ...         | PTY |        | PROC |
-/// |      + <===== |          + <===== |     + <=====       <===== |     + <===== +      |
-/// |      | stdout |          | stdout |     | stdout  ...  stdout |     | stdout |      |
-/// ========        ============        |     |                     =======        ========
-///                                     |     |
-///                                     |     |                     =======        ========
-///                                     |     | stdin   ...  stdin  |     | stdin  |      |
-///                                     |     | =====>       =====> +     | =====> +      |
-///                                     | PTY |         ...         | PTY |        | PROC |
-///                                     |     + <=====       <===== |     + <===== +      |
-///                                     |     | stdout  ...  stdout |     | stdout |      |
-///                                     |     |                     =======        ========
-///                                     |     |
-///                                     |     |                     =======        ========
-///                                     |     | stdin   ...  stdin  |     | stdin  |      |
-///                                     |     | =====>       =====> +     | =====> +      |
-///                                     |     |         ...         | PTY |        | PROC |
-///                                     |     + <=====       <===== |     + <===== +      |
-///                                     |     | stdout  ...  stdout |     | stdout |      |
-///                                     =======                     =======        ========
-///
-
-mod mux;
-
-fn open_pty_master() -> RawFd {
-    let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR) };
-    unsafe { libc::grantpt(master_fd) };
-    unsafe { libc::unlockpt(master_fd) };
-    master_fd
+struct NcursesWindow {
+    height: i32,
+    width: i32,
+    window: *mut i8,
+    cursor_y: i32,
+    cursor_x: i32,
 }
 
-fn get_pty_slave_name(master_fd: RawFd) -> CString {
-    let slave_name = unsafe { CStr::from_ptr(libc::ptsname(master_fd)) };
-    slave_name.to_owned()
+impl NcursesWindow {
+    fn new(
+        height: i32,
+        width: i32,
+        y: i32,
+        x: i32,
+        border_attr: attr_t
+    ) -> Self {
+        let window = newwin(height, width, y, x);
+        wbkgd(window, border_attr);
+        NcursesWindow { height, width, window, cursor_y: 1, cursor_x: 1 }
+    }
+
+    fn destroy(& self) {
+        delwin(self.window);
+    }
+
+    fn draw_border(& self) {
+        box_(self.window, 0, 0);
+        wrefresh(self.window);
+    }
+
+    fn write_char(&mut self, c: u32) {
+        wmove(self.window, self.cursor_y, self.cursor_x);
+        self.cursor_x += 1;
+        if self.cursor_x == self.width - 1 {
+            self.cursor_x = 1;
+            self.cursor_y += 1;
+        }
+        if self.cursor_y == self.height - 1 {
+            self.cursor_x = 1;
+            self.cursor_y = 1;
+        }
+        waddch(self.window, c);
+        wrefresh(self.window);
+    }
 }
 
-fn child_process(master_fd: RawFd, slave_name: CString) {
-	unsafe {
-		// Close the master fd
-		libc::close(master_fd);
-
-		// Open the slave fd
-		let slave_fd = libc::open(slave_name.as_ptr(), libc::O_RDWR);
-
-		// Set the terminal attributes for the child process
-		let mut term: termios::Termios = std::mem::zeroed();
-		termios::tcgetattr(slave_fd, &mut term).unwrap();
-		termios::cfmakeraw(&mut term);
-		termios::tcsetattr(slave_fd, termios::TCSANOW, &term).unwrap();
-
-		// Wire up the child fds
-		libc::dup2(slave_fd, libc::STDIN_FILENO);
-		libc::dup2(slave_fd, libc::STDOUT_FILENO);
-		libc::dup2(slave_fd, libc::STDERR_FILENO);
-
-		let mut winsize: libc::winsize = std::mem::zeroed();
-		libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut winsize as *mut _);
-		libc::ioctl(slave_fd, libc::TIOCSWINSZ, &winsize as *const _);
-
-		// Start the shell or other program
-		libc::execl(
-			b"/bin/bash\0".as_ptr() as *const libc::c_char,
-			b"/bin/bash\0".as_ptr() as *const libc::c_char,
-			std::ptr::null() as *const libc::c_char,
-		);
-	}
+struct NcursesWindows {
+    win_left_top: NcursesWindow,
+    win_left_bottom: NcursesWindow,
+    win_middle: NcursesWindow,
+    win_right_top: NcursesWindow,
+    win_right_bottom: NcursesWindow,
 }
 
-fn parent_process(raw_master_fd: RawFd, child_pid: i32) {
-    let mux = mux::Mux::new();
+impl NcursesWindows {
+    fn new() -> Self {
+        // Get screen dimensions
+        let mut max_y = 0;
+        let mut max_x = 0;
+        getmaxyx(stdscr(), &mut max_y, &mut max_x);
 
-    let _stdout_thread = thread::spawn(move || {
-        let mut master_fd = unsafe { std::fs::File::from_raw_fd(raw_master_fd) };
-        mux::Mux::handle_stdout(&mut master_fd);
-    });
+        // Calculate window dimensions
+        let half_height = max_y / 2;
+        let side_width = (max_x) / 3;
+        let top_height = half_height;
+        let bottom_height = max_y - half_height;
 
-    let _stdin_thread = thread::spawn(move || {
-        let mut master_fd = unsafe { std::fs::File::from_raw_fd(raw_master_fd) };
-        mux::Mux::handle_stdin(&mut master_fd);
-    });
+        // Create windows
+        let win_left_top = NcursesWindow::new(
+            top_height, 
+            side_width, 
+            0, 
+            0,
+            COLOR_PAIR(1),
+        );
+        let win_left_bottom = NcursesWindow::new(
+            bottom_height, 
+            side_width, 
+            top_height, 
+            0,
+            COLOR_PAIR(1),
+        );
+        let win_middle = NcursesWindow::new(
+            max_y, 
+            side_width, 
+            0, 
+            side_width,
+            COLOR_PAIR(1),
+        );
+        let win_right_top = NcursesWindow::new(
+            top_height, 
+            side_width, 
+            0, 
+            side_width*2,
+            COLOR_PAIR(1),
+        );
+        let win_right_bottom = NcursesWindow::new(
+            bottom_height, 
+            side_width, 
+            top_height, 
+            side_width*2,
+            COLOR_PAIR(1),
+        );
 
-    // Wait for the child process to exit
-    let mut status: libc::c_int = 0;
-    unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        NcursesWindows {
+            win_left_top,
+            win_left_bottom,
+            win_middle,
+            win_right_top,
+            win_right_bottom,
+        }
+    }
 
-    mux.cleanup();
-    process::exit(0);
+    fn teardown(& self) {
+        // Clean up and close ncurses
+        self.win_left_top.destroy();
+        self.win_left_bottom.destroy();
+        self.win_middle.destroy();
+        self.win_right_top.destroy();
+        self.win_right_bottom.destroy();
+    }
+
+    fn screen_refresh(& self) {
+        // Draw borders
+        self.win_left_top.draw_border();
+        self.win_left_bottom.draw_border();
+        self.win_middle.draw_border();
+        self.win_right_top.draw_border();
+        self.win_right_bottom.draw_border();
+    }
+
+    fn write_char_to_middle(&mut self, c: u32) {
+        // Refresh windows
+        self.win_middle.write_char(c);
+    }
 }
-
 
 fn main() {
-    let master_fd = open_pty_master();
-    let slave_name = get_pty_slave_name(master_fd);
+    // Initialize ncurses
+    initscr();
+    start_color();
+    raw();
+    keypad(stdscr(), true);
+    noecho();
 
-    let pid = unsafe { libc::fork() };
-    if pid == 0 {
-        child_process(master_fd, slave_name);
-    } else {
-        parent_process(master_fd, pid);
+    // Define color pairs
+    init_pair(1, COLOR_RED, COLOR_BLACK);
+    init_pair(2, COLOR_GREEN, COLOR_BLACK);
+    init_pair(3, COLOR_YELLOW, COLOR_BLACK);
+    init_pair(4, COLOR_BLUE, COLOR_BLACK);
+    init_pair(5, COLOR_MAGENTA, COLOR_BLACK);
+
+    let mut windows = NcursesWindows::new();
+    refresh();
+    windows.screen_refresh();
+    // Wait for user input
+    let mut ch = getch();
+    while ch != 0x0a {
+        ch = getch();
+        windows.write_char_to_middle(0x61);
     }
+    windows.teardown();
+    endwin();
 }
 
